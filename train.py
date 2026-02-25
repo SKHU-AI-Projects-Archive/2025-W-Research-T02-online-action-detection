@@ -1,5 +1,8 @@
 import argparse
+from logging import config
 import torch
+import shutil
+import os
 
 from setup import Configuration
 from datasets import build_dataloader
@@ -19,12 +22,16 @@ def parse_args():
 
 def main():
     args = parse_args()
-    config = Configuration('configs/base.ini', args.config)
+    config = Configuration(args.config)
     set_seed(config.seed)
 
     config.log_dir = generate_log_dir(config)
     logger = build_logger(config, log_filename='train.log')
     logger.info(f"Training started! Logging directory: {config.log_dir}")
+
+    backup_path = os.path.join(config.log_dir, 'config_backup.ini')
+    shutil.copy(args.config, backup_path)
+    logger.info(f"Config backup saved to: {backup_path}")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")

@@ -18,7 +18,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    config = Configuration('configs/base.ini', args.config)
+    config = Configuration(args.config)
     set_seed(config.seed)
 
     config.log_dir = config.exp_dir 

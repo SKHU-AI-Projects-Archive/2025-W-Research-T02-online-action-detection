@@ -10,13 +10,16 @@ class GATv2(nn.Module):
         self.hidden_channels = config.hidden_channels
         self.out_channels = config.out_channels
         self.num_heads = config.num_heads
-        self.dropout_rate = config.dropout_rate
+        self.dropout = config.dropout
         self.num_classes = config.num_classes
+
+        self.dummy_param = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         N, T, C, E = x.shape
         x = x.reshape(N * T, C, E)
         out = torch.zeros(N * T, self.num_classes, dtype=torch.float32)
+        out = out + self.dummy_param
         out = out.reshape(N, T, self.num_classes)
 
         return out

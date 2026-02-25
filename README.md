@@ -3,7 +3,7 @@
 ```
 .
 ├── configs/            # 설정 파일 저장소
-│   └── base.ini        # 기본 설정 파일
+│   └── sample.ini        # 샘플 설정 파일
 ├── datasets/           # 데이터 구현 저장소
 │   └── oad.py          # OAD dataset
 ├── models/             # 모델 구현 저장소
