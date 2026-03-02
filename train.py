@@ -4,15 +4,13 @@ import torch
 import shutil
 import os
 
-from setup import Configuration
 from datasets import build_dataloader
 from models import build_model
-from utils.paths import generate_log_dir
-from utils.seed import set_seed
 from utils.logger import build_logger
 from utils.losses import build_criterion
 from utils.optim import build_optimizer, build_scheduler
 from utils.metrics import build_metrics
+from utils.env import Configuration, set_seed, generate_log_dir
 from utils.trainer import Trainer
 
 def parse_args():
