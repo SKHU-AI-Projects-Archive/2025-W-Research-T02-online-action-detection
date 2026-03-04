@@ -4,14 +4,14 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from setup import Configuration
 from datasets import build_dataloader
 from models import build_model
-from utils.seed import set_seed
 from utils.logger import build_logger
 from utils.losses import build_criterion
 from utils.metrics import build_metrics
+from utils.env import Configuration, set_seed
 from utils.evaluator import Evaluator
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate AI Model")
