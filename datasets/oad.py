@@ -1,4 +1,5 @@
 import os
+import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -13,6 +14,7 @@ class OAD(Dataset):
         self.in_channels = int(config.in_channels)
         self.data_path = os.path.join(self.data_dir, "Data")
         self.label_path = os.path.join(self.data_dir, "Label")
+        self.balanced_sampling = getattr(config, 'balanced_sampling', 'false').lower() == 'true'
 
         split_file = os.path.join(self.data_dir, "Split", "Split.txt")
         target = "training" if split == "train" else "testing"
@@ -58,7 +60,7 @@ class OAD(Dataset):
             self._lengths.append(T)
             self._files.append(file_name)
 
-        # 슬라이딩 윈도우 생성 후 action/bg 분리
+        # Build sliding windows
         action_windows = []
         bg_windows = []
 
@@ -77,18 +79,16 @@ class OAD(Dataset):
                 else:
                     bg_windows.append((file_id, 0))
 
-        # bg를 action 수만큼만 랜덤 샘플링 (1:1)
-        import random
-        n_action = len(action_windows)
-        sampled_bg = random.sample(bg_windows, min(n_action, len(bg_windows)))
-        self.windows = action_windows + sampled_bg
-        random.shuffle(self.windows)
+        if self.balanced_sampling:
+            # 1:1 balanced sampling: sample bg windows to match action count
+            n_action = len(action_windows)
+            sampled_bg = random.sample(bg_windows, min(n_action, len(bg_windows)))
+            self.windows = action_windows + sampled_bg
+        else:
+            # Use all windows (original distribution)
+            self.windows = action_windows + bg_windows
 
-        total_frames = sum(len(l) for l in self._labels)
-        action_frames = sum((l > 0).sum() for l in self._labels)
-        bg_frames = total_frames - action_frames
-        print(f"[DEBUG] total: {total_frames} | action: {action_frames} ({action_frames/total_frames*100:.1f}%) | bg: {bg_frames} ({bg_frames/total_frames*100:.1f}%)")
-        print(f"[DEBUG] OAD split={split} → action_windows: {n_action} | bg_windows: {len(sampled_bg)} | total: {len(self.windows)} | stride: {self.stride}")
+        random.shuffle(self.windows)
 
     def __len__(self):
         return len(self.windows)

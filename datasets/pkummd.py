@@ -15,6 +15,7 @@ class PKUMMD(Dataset):
         self.in_channels = int(config.in_channels)
         self.data_path = os.path.join(self.data_dir, "Data")
         self.label_path = os.path.join(self.data_dir, "Label")
+        self.balanced_sampling = getattr(config, 'balanced_sampling', 'false').lower() == 'true'
 
         split_path = os.path.join(self.data_dir, "Split", "cross-subject.txt")
         with open(split_path, "r") as f:
@@ -33,7 +34,6 @@ class PKUMMD(Dataset):
             for f in raw.split(",")
             if f.strip()
         ]
-        
 
         self.stride = self.num_frames // 2
 
@@ -70,7 +70,7 @@ class PKUMMD(Dataset):
             self._lengths.append(T)
             self._files.append(file_name)
 
-        # action/bg 분리 후 1:1 균형 샘플링
+        # Build sliding windows
         action_windows = []
         bg_windows = []
 
@@ -89,18 +89,16 @@ class PKUMMD(Dataset):
                 else:
                     bg_windows.append((file_id, 0))
 
-        n_action = len(action_windows)
-        sampled_bg = random.sample(bg_windows, min(n_action, len(bg_windows)))
-        self.windows = action_windows + sampled_bg
+        if self.balanced_sampling:
+            # 1:1 balanced sampling: sample bg windows to match action count
+            n_action = len(action_windows)
+            sampled_bg = random.sample(bg_windows, min(n_action, len(bg_windows)))
+            self.windows = action_windows + sampled_bg
+        else:
+            # Use all windows (original distribution)
+            self.windows = action_windows + bg_windows
+
         random.shuffle(self.windows)
-
-        total_frames = sum(len(l) for l in self._labels)
-        action_frames = sum((l > 0).sum() for l in self._labels)
-        bg_frames = total_frames - action_frames
-        print(f"[DEBUG] total: {total_frames} | action: {action_frames} ({action_frames/total_frames*100:.1f}%) | bg: {bg_frames} ({bg_frames/total_frames*100:.1f}%)")
-
-
-        print(f"[DEBUG] PKUMMD split={split} → action_windows: {n_action} | bg_windows: {len(sampled_bg)} | total: {len(self.windows)} | stride: {self.stride}")
 
     def __len__(self):
         return len(self.windows)
