@@ -15,7 +15,7 @@ class PKUMMD(Dataset):
         self.in_channels = int(config.in_channels)
         self.data_path = os.path.join(self.data_dir, "Data")
         self.label_path = os.path.join(self.data_dir, "Label")
-        self.balanced_sampling = getattr(config, 'balanced_sampling', 'false').lower() == 'true'
+        self.balanced_sampling = bool(getattr(config, 'balanced_sampling', False))
 
         split_path = os.path.join(self.data_dir, "Split", "cross-subject.txt")
         with open(split_path, "r") as f:

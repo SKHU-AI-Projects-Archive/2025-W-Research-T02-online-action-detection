@@ -14,7 +14,7 @@ class OAD(Dataset):
         self.in_channels = int(config.in_channels)
         self.data_path = os.path.join(self.data_dir, "Data")
         self.label_path = os.path.join(self.data_dir, "Label")
-        self.balanced_sampling = getattr(config, 'balanced_sampling', 'false').lower() == 'true'
+        self.balanced_sampling = bool(getattr(config, 'balanced_sampling', False))
 
         split_file = os.path.join(self.data_dir, "Split", "Split.txt")
         target = "training" if split == "train" else "testing"
