@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
 
 # Kinect v2 25개 관절 스켈레톤 edge 정의
@@ -101,10 +102,11 @@ class GATv2(nn.Module):
         offset = offset.unsqueeze(1).expand(-1, E)               # (B*T, E)
         edge_index_batch = edge_index.unsqueeze(0).expand(num_graphs, -1, -1)  # (B*T, 2, E)
         edge_index_batch = edge_index_batch + offset.unsqueeze(1)              # (B*T, 2, E)
-        edge_index_batch = edge_index_batch.reshape(2, -1)                     # (2, B*T*E)
+        edge_index_batch = edge_index_batch.transpose(0, 1).reshape(2, -1)  # (2, B*T*E)
 
         # GATv2Conv forward
         out = self.gat(x, edge_index_batch)  # (B*T*N, hidden_channels)
+        out = F.elu(out)                      # ELU 활성화
 
         # reshape back
         out = out.reshape(B * T, N, self.hidden_channels)  # (B*T, N, hidden)
