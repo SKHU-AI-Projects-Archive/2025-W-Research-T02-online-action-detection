@@ -55,15 +55,12 @@ class PKUMMD(Dataset):
             T = int(data.shape[0])
             data = data.reshape(T, 2, self.num_nodes, self.in_channels)
 
-            labels_p1, labels_p2 = self._load_labels_by_person(label_file, T)
+            # label은 영상 전체에 대한 것 (사람 구분 없음)
+            labels = self._load_labels(label_file, T)
 
-            candidates = []
-            if labels_p1.any(): candidates.append(0)
-            if labels_p2.any(): candidates.append(1)
-            person = random.choice(candidates) if candidates else random.randint(0, 1)
-
+            # skeleton은 두 사람 중 하나 선택
+            person = random.randint(0, 1)
             clip_data = data[:, person]
-            labels = labels_p1 if person == 0 else labels_p2
 
             self._data.append(clip_data)
             self._labels.append(labels)
@@ -90,40 +87,45 @@ class PKUMMD(Dataset):
                     bg_windows.append((file_id, 0))
 
         if self.balanced_sampling:
-            # 1:1 balanced sampling: sample bg windows to match action count
             n_action = len(action_windows)
             sampled_bg = random.sample(bg_windows, min(n_action, len(bg_windows)))
             self.windows = action_windows + sampled_bg
         else:
-            # Use all windows (original distribution)
             self.windows = action_windows + bg_windows
 
         random.shuffle(self.windows)
 
+        total_frames = sum(len(l) for l in self._labels)
+        action_frames = sum((l > 0).sum() for l in self._labels)
+        bg_frames = total_frames - action_frames
+        print(f"[DEBUG] total: {total_frames} | action: {action_frames} ({action_frames/total_frames*100:.1f}%) | bg: {bg_frames} ({bg_frames/total_frames*100:.1f}%)")
+        print(f"[DEBUG] PKUMMD split={split} → action_windows: {len(action_windows)} | bg_windows: {len(self.windows) - len(action_windows)} | total: {len(self.windows)} | stride: {self.stride}")
+
     def __len__(self):
         return len(self.windows)
 
-    def _load_labels_by_person(self, label_file, T):
-        labels_p1 = np.zeros(T, dtype=np.int64)
-        labels_p2 = np.zeros(T, dtype=np.int64)
+    def _load_labels(self, label_file, T):
+        """
+        label 파일 형식: cls, start, end, confidence
+        4번째 컬럼은 confidence (1=약함, 2=강함)이며 사람 번호가 아님
+        모든 label을 영상 전체에 적용
+        """
+        labels = np.zeros(T, dtype=np.int64)
 
         if not os.path.exists(label_file):
-            return labels_p1, labels_p2
+            return labels
 
         with open(label_file, "r") as f:
             for line in f:
                 parts = line.strip().split(",")
                 if len(parts) != 4:
                     continue
-                cls, start, end, pid = map(int, parts)
+                cls, start, end, confidence = map(int, parts)
                 start_f = max(start - 1, 0)
                 end_f = min(end, T)
-                if pid == 1:
-                    labels_p1[start_f:end_f] = cls
-                elif pid == 2:
-                    labels_p2[start_f:end_f] = cls
+                labels[start_f:end_f] = cls
 
-        return labels_p1, labels_p2
+        return labels
 
     def __getitem__(self, idx):
         file_id, start_idx = self.windows[idx]
