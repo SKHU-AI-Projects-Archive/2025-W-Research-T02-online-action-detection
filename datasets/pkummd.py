@@ -15,7 +15,7 @@ class PKUMMD(Dataset):
         self.in_channels = int(config.in_channels)
         self.data_path = os.path.join(self.data_dir, "Data")
         self.label_path = os.path.join(self.data_dir, "Label")
-        self.balanced_sampling = bool(getattr(config, 'balanced_sampling', False))
+
 
         split_path = os.path.join(self.data_dir, "Split", "cross-subject.txt")
         with open(split_path, "r") as f:
@@ -75,23 +75,19 @@ class PKUMMD(Dataset):
             if T >= self.num_frames:
                 for start in range(0, T - self.num_frames + 1, self.stride):
                     clip_labels = self._labels[file_id][start:start + self.num_frames]
-                    if (clip_labels > 0).any():
+                    # majority voting: 절반 이상이 action이면 action window
+                    if (clip_labels > 0).sum() > len(clip_labels) // 2:
                         action_windows.append((file_id, start))
                     else:
                         bg_windows.append((file_id, start))
             else:
                 clip_labels = self._labels[file_id]
-                if (clip_labels > 0).any():
+                if (clip_labels > 0).sum() > len(clip_labels) // 2:
                     action_windows.append((file_id, 0))
                 else:
                     bg_windows.append((file_id, 0))
 
-        if self.balanced_sampling:
-            n_action = len(action_windows)
-            sampled_bg = random.sample(bg_windows, min(n_action, len(bg_windows)))
-            self.windows = action_windows + sampled_bg
-        else:
-            self.windows = action_windows + bg_windows
+        self.windows = action_windows + bg_windows
 
         random.shuffle(self.windows)
 
@@ -99,7 +95,7 @@ class PKUMMD(Dataset):
         action_frames = sum((l > 0).sum() for l in self._labels)
         bg_frames = total_frames - action_frames
         print(f"[DEBUG] total: {total_frames} | action: {action_frames} ({action_frames/total_frames*100:.1f}%) | bg: {bg_frames} ({bg_frames/total_frames*100:.1f}%)")
-        print(f"[DEBUG] PKUMMD split={split} → action_windows: {len(action_windows)} | bg_windows: {len(self.windows) - len(action_windows)} | total: {len(self.windows)} | stride: {self.stride}")
+        print(f"[DEBUG] PKUMMD split={split} → action_windows: {len(action_windows)} | bg_windows: {len(bg_windows)} | total: {len(self.windows)} | stride: {self.stride}")
 
     def __len__(self):
         return len(self.windows)

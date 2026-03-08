@@ -14,7 +14,6 @@ class OAD(Dataset):
         self.in_channels = int(config.in_channels)
         self.data_path = os.path.join(self.data_dir, "Data")
         self.label_path = os.path.join(self.data_dir, "Label")
-        self.balanced_sampling = bool(getattr(config, 'balanced_sampling', False))
 
         split_file = os.path.join(self.data_dir, "Split", "Split.txt")
         target = "training" if split == "train" else "testing"
@@ -60,7 +59,7 @@ class OAD(Dataset):
             self._lengths.append(T)
             self._files.append(file_name)
 
-        # Build sliding windows
+        # Build sliding windows with majority voting
         action_windows = []
         bg_windows = []
 
@@ -68,27 +67,22 @@ class OAD(Dataset):
             if T >= self.num_frames:
                 for start in range(0, T - self.num_frames + 1, self.stride):
                     clip_labels = self._labels[file_id][start:start + self.num_frames]
-                    if (clip_labels > 0).any():
+                    # majority voting: 절반 이상이 action이면 action window
+                    if (clip_labels > 0).sum() > len(clip_labels) // 2:
                         action_windows.append((file_id, start))
                     else:
                         bg_windows.append((file_id, start))
             else:
                 clip_labels = self._labels[file_id]
-                if (clip_labels > 0).any():
+                if (clip_labels > 0).sum() > len(clip_labels) // 2:
                     action_windows.append((file_id, 0))
                 else:
                     bg_windows.append((file_id, 0))
 
-        if self.balanced_sampling:
-            # 1:1 balanced sampling: sample bg windows to match action count
-            n_action = len(action_windows)
-            sampled_bg = random.sample(bg_windows, min(n_action, len(bg_windows)))
-            self.windows = action_windows + sampled_bg
-        else:
-            # Use all windows (original distribution)
-            self.windows = action_windows + bg_windows
-
+        self.windows = action_windows + bg_windows
         random.shuffle(self.windows)
+
+        print(f"[DEBUG] OAD split={split} → action_windows: {len(action_windows)} | bg_windows: {len(bg_windows)} | total: {len(self.windows)}")
 
     def __len__(self):
         return len(self.windows)
