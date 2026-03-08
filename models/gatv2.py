@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
 
-# Kinect v2 25개 관절 스켈레톤 edge 정의
 KINECT_EDGES = [
     (0, 1),   # SpineBase - SpineMid
     (1, 2),   # SpineMid - SpineShoulder
@@ -33,25 +32,31 @@ KINECT_EDGES = [
 
 
 def build_edge_index(edges, num_nodes, bidirectional=True):
-    """
-    스켈레톤 edge 리스트를 torch_geometric 형식의 edge_index (2, E)로 변환.
-    bidirectional=True이면 양방향 edge 추가.
-    """
     src, dst = zip(*edges)
-    src = list(src)
-    dst = list(dst)
-
+    src, dst = list(src), list(dst)
     if bidirectional:
-        src, dst = src + dst, dst + src  # 양방향
+        src, dst = src + dst, dst + src
+    return torch.tensor([src, dst], dtype=torch.long)
 
-    edge_index = torch.tensor([src, dst], dtype=torch.long)
-    return edge_index
+
+def tsm(x, fold_div=8):
+    """
+    Temporal Shift Module (no parameters).
+    x: (B, T, N, C)
+    Shifts a fraction of channels forward and backward in time.
+    """
+    B, T, N, C = x.shape
+    fold = C // fold_div
+    out = torch.zeros_like(x)
+    out[:, 1:,  :, :fold]       = x[:, :-1, :, :fold]        # forward shift
+    out[:, :-1, :, fold:2*fold] = x[:, 1:,  :, fold:2*fold]  # backward shift
+    out[:, :,   :, 2*fold:]     = x[:, :,   :, 2*fold:]       # unchanged
+    return out
 
 
 class GATv2(nn.Module):
     def __init__(self, config):
         super(GATv2, self).__init__()
-        self.config = config
         self.in_channels = int(config.in_channels)
         self.hidden_channels = int(config.hidden_channels)
         self.out_channels = int(config.out_channels)
@@ -62,10 +67,13 @@ class GATv2(nn.Module):
         assert self.hidden_channels % self.num_heads == 0
         self.head_dim = self.hidden_channels // self.num_heads
 
-        # torch_geometric GATv2Conv 사용
-        # concat=True → 출력 크기: num_heads * head_dim = hidden_channels
+        # Linear projection: in_channels(3) → hidden_channels(128)
+        # Required to ensure sufficient channels for TSM (fold = hidden // fold_div = 16)
+        self.input_proj = nn.Linear(self.in_channels, self.hidden_channels)
+
+        # GATv2Conv operates on projected hidden_channels(128)
         self.gat = GATv2Conv(
-            in_channels=self.in_channels,
+            in_channels=self.hidden_channels,
             out_channels=self.head_dim,
             heads=self.num_heads,
             concat=True,
@@ -73,48 +81,48 @@ class GATv2(nn.Module):
             add_self_loops=True,
         )
 
-        # 스켈레톤 edge_index 등록 (고정, 학습 X)
         edge_index = build_edge_index(KINECT_EDGES, self.num_nodes, bidirectional=True)
         self.register_buffer('edge_index', edge_index)
 
-        # classifier: mean pooling 후 분류
-        self.classifier = nn.Linear(
-            self.hidden_channels,
-            self.out_channels
-        )
+        self.classifier = nn.Linear(self.hidden_channels, self.out_channels)
+
+        # Save original GAT forward once at init for monkey-patching
+        self._original_gat_forward = self.gat.forward
 
     def forward(self, x):
         # x: (B, T, C, N)
         B, T, C, N = x.shape
 
-        # GATv2Conv는 (num_nodes, in_channels) 입력
-        x = x.permute(0, 1, 3, 2)   # (B, T, N, C)
-        x = x.reshape(B * T * N, C)  # (B*T*N, C)
+        # Monkey-patch GAT forward to inject TSM before each GAT call
+        def patched_forward(x_flat, edge_index, **kwargs):
+            # x_flat: (B*T*N, hidden=128)
+            H = x_flat.size(-1)
+            x_4d = x_flat.reshape(B, T, N, H)          # restore temporal axis: (B, T, N, 128)
+            x_shifted = tsm(x_4d)                       # apply TSM (fold = 128 // 8 = 16)
+            x_flat2 = x_shifted.reshape(B * T * N, H)  # flatten back
+            return self._original_gat_forward(x_flat2, edge_index, **kwargs)
 
-        # edge_index를 B*T개 그래프 배치에 맞게 확장
-        # torch_geometric 배치 방식: 각 그래프마다 노드 offset 추가
+        self.gat.forward = patched_forward
+
+        # Linear projection: (B,T,C,N) → (B,T,N,C) → (B*T*N, C) → (B*T*N, 128)
+        x = x.permute(0, 1, 3, 2)              # (B, T, N, C=3)
+        x = x.reshape(B * T * N, C)            # (B*T*N, C=3)
+        x = self.input_proj(x)                 # (B*T*N, 128)
+
+        # Expand edge_index for all graphs in the batch
         num_graphs = B * T
-        edge_index = self.edge_index  # (2, E)
-        E = edge_index.size(1)
+        E = self.edge_index.size(1)
+        offset = torch.arange(num_graphs, device=x.device) * N
+        offset = offset.unsqueeze(1).expand(-1, E)
+        edge_index_batch = self.edge_index.unsqueeze(0).expand(num_graphs, -1, -1)
+        edge_index_batch = edge_index_batch + offset.unsqueeze(1)
+        edge_index_batch = edge_index_batch.transpose(0, 1).reshape(2, -1)
 
-        # offset: [0, N, 2N, ..., (B*T-1)*N]
-        offset = torch.arange(num_graphs, device=x.device) * N  # (B*T,)
-        offset = offset.unsqueeze(1).expand(-1, E)               # (B*T, E)
-        edge_index_batch = edge_index.unsqueeze(0).expand(num_graphs, -1, -1)  # (B*T, 2, E)
-        edge_index_batch = edge_index_batch + offset.unsqueeze(1)              # (B*T, 2, E)
-        edge_index_batch = edge_index_batch.transpose(0, 1).reshape(2, -1)  # (2, B*T*E)
+        out = self.gat(x, edge_index_batch)    # patched_forward: TSM → GAT
+        out = F.elu(out)                        # (B*T*N, hidden_channels)
 
-        # GATv2Conv forward
-        out = self.gat(x, edge_index_batch)  # (B*T*N, hidden_channels)
-        out = F.elu(out)                      # ELU 활성화
-
-        # reshape back
-        out = out.reshape(B * T, N, self.hidden_channels)  # (B*T, N, hidden)
-
-        # mean pooling over nodes
-        out = out.mean(dim=1)                               # (B*T, hidden)
-
-        # classification
-        out = self.classifier(out)                          # (B*T, num_classes)
+        out = out.reshape(B * T, N, self.hidden_channels)
+        out = out.mean(dim=1)                   # mean pooling: (B*T, hidden)
+        out = self.classifier(out)              # (B*T, num_classes)
 
         return out.reshape(B, T, self.out_channels)
