@@ -86,23 +86,37 @@ class GATv2(nn.Module):
 
         self.classifier = nn.Linear(self.hidden_channels, self.out_channels)
 
-        # Save original GAT forward once at init for monkey-patching
+        # Placeholders for batch shape; set in forward() before each GAT call
+        self._B = None
+        self._T = None
+
+        # Save original GATv2Conv forward before monkey-patching
         self._original_gat_forward = self.gat.forward
+
+        # Monkey-patch once at init: inject TSM inside GATv2Conv.forward
+        # _B and _T are updated in forward() so patched_forward always sees current batch shape
+        def _make_patched_forward():
+            def patched(x_flat, edge_index, **kwargs):
+                # x_flat: (B*T*N, H)
+                B = self._B
+                T = self._T
+                N = self.num_nodes
+                H = x_flat.size(-1)
+                x_4d = x_flat.reshape(B, T, N, H)           # (B, T, N, H)
+                x_shifted = tsm(x_4d)                        # apply TSM
+                x_flat2 = x_shifted.reshape(B * T * N, H)   # (B*T*N, H)
+                return self._original_gat_forward(x_flat2, edge_index, **kwargs)
+            return patched
+
+        self.gat.forward = _make_patched_forward()
 
     def forward(self, x):
         # x: (B, T, C, N)
         B, T, C, N = x.shape
 
-        # Monkey-patch GAT forward to inject TSM before each GAT call
-        def patched_forward(x_flat, edge_index, **kwargs):
-            # x_flat: (B*T*N, hidden=128)
-            H = x_flat.size(-1)
-            x_4d = x_flat.reshape(B, T, N, H)          # restore temporal axis: (B, T, N, 128)
-            x_shifted = tsm(x_4d)                       # apply TSM (fold = 128 // 8 = 16)
-            x_flat2 = x_shifted.reshape(B * T * N, H)  # flatten back
-            return self._original_gat_forward(x_flat2, edge_index, **kwargs)
-
-        self.gat.forward = patched_forward
+        # Store batch shape for patched_forward
+        self._B = B
+        self._T = T
 
         # Linear projection: (B,T,C,N) → (B,T,N,C) → (B*T*N, C) → (B*T*N, 128)
         x = x.permute(0, 1, 3, 2)              # (B, T, N, C=3)
@@ -114,15 +128,15 @@ class GATv2(nn.Module):
         E = self.edge_index.size(1)
         offset = torch.arange(num_graphs, device=x.device) * N
         offset = offset.unsqueeze(1).expand(-1, E)
-        edge_index_batch = self.edge_index.unsqueeze(0).expand(num_graphs, -1, -1)
-        edge_index_batch = edge_index_batch + offset.unsqueeze(1)
-        edge_index_batch = edge_index_batch.transpose(0, 1).reshape(2, -1)
+        edge_index_batch = self.edge_index.unsqueeze(0).expand(num_graphs, -1, -1)  # (B*T, 2, E)
+        edge_index_batch = edge_index_batch + offset.unsqueeze(1)                   # (B*T, 2, E)
+        edge_index_batch = edge_index_batch.transpose(0, 1).reshape(2, -1)          # (2, B*T*E)
 
-        out = self.gat(x, edge_index_batch)    # patched_forward: TSM → GAT
+        out = self.gat(x, edge_index_batch)    # patched_forward: TSM → GAT → (B*T*N, hidden)
         out = F.elu(out)                        # (B*T*N, hidden_channels)
 
         out = out.reshape(B * T, N, self.hidden_channels)
-        out = out.mean(dim=1)                   # mean pooling: (B*T, hidden)
+        out = out.mean(dim=1)                   # mean pooling over nodes: (B*T, hidden)
         out = self.classifier(out)              # (B*T, num_classes)
 
         return out.reshape(B, T, self.out_channels)
