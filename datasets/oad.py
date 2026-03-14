@@ -87,6 +87,36 @@ class OAD(Dataset):
     def __len__(self):
         return len(self.windows)
 
+    @staticmethod
+    def _normalize_skeleton(clip):
+        """
+        View-invariant skeleton normalization.
+
+        입력: clip (T, N, C) — numpy float32
+        출력: clip (T, N, C) — 정규화된 numpy float32
+
+        1) SpineBase(joint 0) 원점 정규화
+           모든 프레임, 모든 관절에서 SpineBase 좌표를 빼서
+           카메라/피실험자 위치 변화에 무관하게 만듦
+
+        2) 어깨 너비 스케일 정규화
+           ShoulderLeft(joint 5) ↔ ShoulderRight(joint 9) 거리의
+           프레임 평균으로 나눠서 신체 크기 차이를 제거
+           (1e-6 안전값으로 zero-division 방지)
+        """
+        # 1) SpineBase 원점 정규화
+        spine_base = clip[:, 0:1, :]        # (T, 1, C)
+        clip = clip - spine_base            # (T, N, C)
+
+        # 2) 어깨 너비 스케일 정규화
+        # ShoulderLeft=5, ShoulderRight=9
+        shoulder_vec = clip[:, 5, :] - clip[:, 9, :]       # (T, C)
+        shoulder_dist = np.linalg.norm(shoulder_vec, axis=1)  # (T,)
+        mean_dist = shoulder_dist.mean() + 1e-6             # scalar
+        clip = clip / mean_dist                             # (T, N, C)
+
+        return clip
+
     def __getitem__(self, idx):
         file_id, start_idx = self.windows[idx]
         data = self._data[file_id]
@@ -94,19 +124,24 @@ class OAD(Dataset):
         T = self._lengths[file_id]
 
         if T >= self.num_frames:
-            clip = data[start_idx:start_idx + self.num_frames]
+            clip = data[start_idx:start_idx + self.num_frames]         # (T, N, C)
             clip_labels = labels[start_idx:start_idx + self.num_frames]
         else:
             pad_len = self.num_frames - T
             clip = np.concatenate(
                 [data, np.zeros((pad_len, self.num_nodes, self.in_channels), dtype=np.float32)],
                 axis=0
-            )
+            )                                                           # (T, N, C)
             clip_labels = np.concatenate(
                 [labels, np.zeros((pad_len,), dtype=np.int64)],
                 axis=0
             )
 
+        # ── Skeleton 정규화 (permute 전 numpy 단계에서 수행) ──────────────
+        # clip shape: (T, N, C) → 정규화 → 동일 shape 유지
+        clip = self._normalize_skeleton(clip)
+
+        # (T, N, C) → (T, C, N)
         clip = torch.from_numpy(clip).permute(0, 2, 1).contiguous()
         clip_labels = torch.from_numpy(clip_labels).long()
 
