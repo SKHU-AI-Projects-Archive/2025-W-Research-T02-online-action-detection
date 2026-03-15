@@ -39,6 +39,39 @@ def build_edge_index(edges, num_nodes, bidirectional=True):
     return torch.tensor([src, dst], dtype=torch.long)
 
 
+def compute_edge_attr(x_4d_raw, edge_index_base):
+    """
+    Compute edge attributes (distance + angle) from raw xyz joint coordinates.
+
+    e_ij = (d_ij, theta_ij)
+      - d_ij     : Euclidean distance between joint i and j (3D)
+      - theta_ij : orientation angle in xy-plane (atan2(dy, dx))
+
+    Args:
+        x_4d_raw       : (B, T, N, C) -- raw input xyz coordinates (before input_proj)
+        edge_index_base: (2, E_base)  -- un-batched edge indices (single graph)
+
+    Returns:
+        edge_attr : (B*T*E_base, 2)
+    """
+    B, T, N, C = x_4d_raw.shape
+    x_flat = x_4d_raw.reshape(B * T, N, C)
+
+    src    = edge_index_base[0]   # (E_base,)
+    dst    = edge_index_base[1]   # (E_base,)
+    E_base = src.size(0)
+
+    pos_i = x_flat[:, src, :]     # (B*T, E_base, C)
+    pos_j = x_flat[:, dst, :]     # (B*T, E_base, C)
+    diff  = pos_j - pos_i         # (B*T, E_base, C)
+
+    d_ij     = diff.norm(dim=-1, keepdim=True)                        # (B*T, E_base, 1)
+    theta_ij = torch.atan2(diff[..., 1], diff[..., 0]).unsqueeze(-1)  # (B*T, E_base, 1)
+
+    edge_attr = torch.cat([d_ij, theta_ij], dim=-1)
+    return edge_attr.reshape(B * T * E_base, 2)    # (B*T*E, 2)
+
+
 def _dilated_shift(x, fold_div=8, mode='uni', dilations=(1, 2, 4, 8)):
     """
     Dilated Temporal Shift (no parameters, internal helper).
@@ -46,8 +79,8 @@ def _dilated_shift(x, fold_div=8, mode='uni', dilations=(1, 2, 4, 8)):
     Args:
         x         : (B, T, N, C)
         fold_div  : total fold = C // fold_div channels will be shifted
-        mode      : 'uni' → past→present only  (online-safe)
-                    'bi'  → past↔future        (offline only)
+        mode      : 'uni' -> past->present only  (online-safe)
+                    'bi'  -> past<->future        (offline only)
         dilations : dilation values; fold channels split equally across groups
 
     Returns:
@@ -88,11 +121,9 @@ class GatedTSM(nn.Module):
     Node-wise Gated Temporal Shift Module.
 
         gate   = sigmoid(W_g @ x + b)
-        output = x + gate ⊙ (shift(x) - x)
+        output = x + gate (shift(x) - x)
 
-    Also returns the temporal delta (shifted - x) for use in MSE.
-
-    bias=-2.0 → initial gate ≈ 0.12 → near-identity at start
+    bias=-2.0 -> initial gate ~0.12 -> near-identity at start
     """
 
     def __init__(self, channels, num_nodes, fold_div=8, mode='uni', dilations=(1, 2, 4, 8)):
@@ -115,8 +146,7 @@ class GatedTSM(nn.Module):
         Args:
             x_4d : (B, T, N, C)
         Returns:
-            out   : (B, T, N, C)  — gated output
-            delta : (B, T, N, C)  — temporal delta (shifted - x), used by MSE
+            out  : (B, T, N, C)
         """
         B, T, N, C = x_4d.shape
         assert N == self.num_nodes, \
@@ -127,79 +157,31 @@ class GatedTSM(nn.Module):
         gate_4d = gate.reshape(B, T, N, C)
 
         shifted = _dilated_shift(x_4d, self.fold_div, self.mode, self.dilations)
-        delta   = shifted - x_4d                          # temporal difference
+        delta   = shifted - x_4d
 
-        return x_4d + gate_4d * delta, delta
-
-
-class MotionSqueezedExcitation(nn.Module):
-    """
-    Motion-Squeezed Excitation (MSE).
-
-    Reuses the temporal delta from GatedTSM to compute per-node motion scores,
-    then uses these scores to re-weight GAT output features.
-
-    Intuition:
-      - GatedTSM decides "how much past info to absorb" per channel
-      - MSE asks "which nodes are currently moving?" and amplifies them
-      - Nodes with large motion (e.g. wrists, ankles) get higher weight
-      - Static nodes (e.g. spine) are naturally suppressed
-
-    Flow:
-        delta   : (B, T, N, C)  — |shifted - x| from GatedTSM
-        score   : (B, T, N, 1)  — per-node motion magnitude (mean over C)
-        weight  : (B, T, N, 1)  — sigmoid-gated score → [0, 1]
-        output  : x_gat * (1 + weight)  — residual excitation
-
-    Using (1 + weight) instead of weight alone ensures:
-      - weight=0 → output = x_gat  (identity, no suppression)
-      - weight=1 → output = 2 * x_gat (double excitation for active nodes)
-
-    Args:
-        channels : int — feature dim C (= hidden_channels)
-    """
-
-    def __init__(self, channels):
-        super().__init__()
-        # Lightweight gate: scalar per node from motion score
-        # bias=-1.0 → initial weight ≈ sigmoid(-1) ≈ 0.27 → gentle start
-        self.motion_gate = nn.Linear(1, 1, bias=True)
-        nn.init.constant_(self.motion_gate.weight, 1.0)
-        nn.init.constant_(self.motion_gate.bias, -1.0)
-
-    def forward(self, x_gat, delta):
-        """
-        Args:
-            x_gat : (B, T, N, C)  — GAT output features
-            delta : (B, T, N, C)  — temporal delta from GatedTSM
-
-        Returns:
-            out   : (B, T, N, C)  — motion-excited features
-        """
-        # Per-node motion magnitude: mean of |delta| over channels
-        motion_score = delta.abs().mean(dim=-1, keepdim=True)  # (B, T, N, 1)
-
-        # Learnable gate on motion score
-        weight = torch.sigmoid(self.motion_gate(motion_score))  # (B, T, N, 1)
-
-        # Residual excitation: active nodes amplified, static nodes unchanged
-        return x_gat * (1.0 + weight)
+        return x_4d + gate_4d * delta
 
 
 class CausalConv1d(nn.Module):
     """
     Node-wise Causal Temporal Convolution (online-safe).
 
-    Applied after each GATv2Conv+MSE along the T dimension.
-    Uses left-only padding → strictly causal, no future leakage.
-    Depthwise conv for efficiency. LayerNorm + residual for stability.
+    Applied after each GATv2Conv layer along the T dimension.
+    Each node's features are convolved independently over time
+    using left-only padding -> strictly causal, no future leakage.
+
+    Structure per layer:
+        GatedTSM -> GATv2Conv(edge_attr) -> ELU -> CausalConv1d (this module)
+
+    Uses depthwise conv (groups=channels) for efficiency.
+    Includes LayerNorm + residual connection for stability.
 
     Receptive field = 1 + (kernel_size - 1) * dilation frames into the past.
 
     Args:
-        channels    : int — feature dim C
-        kernel_size : int — temporal kernel size (default 3)
-        dilation    : int — temporal dilation (default 1)
+        channels    : int -- feature dim C (= hidden_channels)
+        kernel_size : int -- temporal kernel size (default 3)
+        dilation    : int -- temporal dilation (default 1)
     """
 
     def __init__(self, channels, kernel_size=3, dilation=1):
@@ -247,37 +229,40 @@ def expand_edge_index(edge_index, num_graphs, num_nodes, device):
 
 class GATv2(nn.Module):
     """
-    GATv2 with GatedTSM, MotionSqueezedExcitation, and optional CausalConv1d.
+    GATv2 with GatedTSM, EGAT (edge attributes), and optional CausalConv1d.
 
     Forward flow per layer:
-        GatedTSM → GATv2Conv → ELU → MSE → (CausalConv1d)
+        GatedTSM -> GATv2Conv(edge_attr) -> ELU -> (CausalConv1d)
 
-    GatedTSM produces temporal delta which is passed to MSE,
-    allowing motion-aware node excitation without extra input.
+    Edge attributes e_ij = (d_ij, theta_ij) computed from raw xyz:
+      - d_ij     : 3D Euclidean distance between joints i and j
+      - theta_ij : orientation angle in xy-plane (atan2)
+
+    This follows the EGAT formulation (StoneGAT, IJCAS 2025),
+    adapted for 3D Kinect skeleton without confidence scores.
 
     Config keys
     -----------
-    in_channels      : int   — input joint feature dim (e.g. 3 for xyz)
-    hidden_channels  : int   — internal feature dim (must be divisible by num_heads)
-    out_channels     : int   — number of action classes
-    num_heads        : int   — GAT attention heads
+    in_channels      : int   -- input joint feature dim (e.g. 3 for xyz)
+    hidden_channels  : int   -- internal feature dim (must be divisible by num_heads)
+    out_channels     : int   -- number of action classes
+    num_heads        : int   -- GAT attention heads
     dropout          : float
-    num_nodes        : int   — skeleton joints (25 for Kinect)
-    num_gat_layers   : int   — number of stacked GATv2Conv layers (default 2)
-    use_tsm          : bool  — whether to apply GatedTSM (default True)
-    tsm_mode         : str   — 'uni' or 'bi' (default 'uni')
-    tsm_fold_div     : int   — fold = hidden // tsm_fold_div (default 8)
-    tsm_dilations    : tuple — dilation list e.g. (1,2,4,16)
-    use_mse          : bool  — whether to apply MSE after GAT (default True)
-    use_causal_conv  : bool  — whether to apply CausalConv1d after MSE (default False)
-    causal_kernel    : int   — kernel size for CausalConv1d (default 3)
-    causal_dilation  : int   — dilation for CausalConv1d (default 1)
+    num_nodes        : int   -- skeleton joints (25 for Kinect)
+    num_gat_layers   : int   -- number of stacked GATv2Conv layers (default 2)
+    use_tsm          : bool  -- whether to apply GatedTSM before each GAT layer (default True)
+    tsm_mode         : str   -- 'uni' (online-safe) or 'bi' (offline) (default 'uni')
+    tsm_fold_div     : int   -- fold = hidden // tsm_fold_div (default 8)
+    tsm_dilations    : tuple -- dilation list e.g. (1,2,4,8)
+    use_causal_conv  : bool  -- whether to apply CausalConv1d after each GAT layer (default False)
+    causal_kernel    : int   -- kernel size for CausalConv1d (default 3)
+    causal_dilation  : int   -- dilation for CausalConv1d (default 1)
     """
 
     def __init__(self, config):
         super(GATv2, self).__init__()
 
-        # ── basic dims ──────────────────────────────────────────────────────────
+        # -- basic dims --
         self.in_channels     = int(config.in_channels)
         self.hidden_channels = int(config.hidden_channels)
         self.out_channels    = int(config.out_channels)
@@ -289,7 +274,7 @@ class GATv2(nn.Module):
             "hidden_channels must be divisible by num_heads"
         self.head_dim = self.hidden_channels // self.num_heads
 
-        # ── TSM config ──────────────────────────────────────────────────────────
+        # -- TSM config --
         self.num_gat_layers = int(getattr(config, 'num_gat_layers', 2))
         self.use_tsm        = bool(getattr(config, 'use_tsm', True))
         self.tsm_mode       = str(getattr(config, 'tsm_mode', 'uni'))
@@ -302,17 +287,19 @@ class GATv2(nn.Module):
             f"len(tsm_dilations) ({len(self.tsm_dilations)})"
         )
 
-        # ── MSE config ──────────────────────────────────────────────────────────
-        self.use_mse = bool(getattr(config, 'use_mse', True))
-
-        # ── CausalConv config ───────────────────────────────────────────────────
+        # -- CausalConv config --
         self.use_causal_conv = bool(getattr(config, 'use_causal_conv', False))
         self.causal_kernel   = int(getattr(config, 'causal_kernel', 3))
         self.causal_dilation = int(getattr(config, 'causal_dilation', 1))
 
-        # ── layers ──────────────────────────────────────────────────────────────
+        # -- edge attr dim: distance + angle = 2 --
+        self.edge_attr_dim = 2
+
+        # -- layers --
         self.input_proj = nn.Linear(self.in_channels, self.hidden_channels)
 
+        # EGAT: GATv2Conv with edge_dim=2
+        # add_self_loops=False: self-loop에는 edge_attr이 없으므로 비활성화
         self.gat_layers = nn.ModuleList([
             GATv2Conv(
                 in_channels=self.hidden_channels,
@@ -320,7 +307,8 @@ class GATv2(nn.Module):
                 heads=self.num_heads,
                 concat=True,
                 dropout=self.dropout,
-                add_self_loops=True,
+                add_self_loops=False,
+                edge_dim=self.edge_attr_dim,
             )
             for _ in range(self.num_gat_layers)
         ])
@@ -338,14 +326,7 @@ class GATv2(nn.Module):
                 for _ in range(self.num_gat_layers)
             ])
 
-        # MSE: one per GAT layer (applied after GAT+ELU)
-        if self.use_mse:
-            self.mse_layers = nn.ModuleList([
-                MotionSqueezedExcitation(channels=self.hidden_channels)
-                for _ in range(self.num_gat_layers)
-            ])
-
-        # CausalConv1d: one per GAT layer (applied after MSE)
+        # CausalConv1d: one per GAT layer (applied after GAT+ELU)
         if self.use_causal_conv:
             self.causal_conv_layers = nn.ModuleList([
                 CausalConv1d(
@@ -370,39 +351,37 @@ class GATv2(nn.Module):
         """
         B, T, C, N = x.shape
 
-        x = x.permute(0, 1, 3, 2)              # (B, T, N, C)
-        x = x.reshape(B * T * N, C)
-        x = self.input_proj(x)                 # (B*T*N, hidden)
+        # raw xyz 보존 -- edge_attr 계산에 사용 (input_proj 전)
+        x_4d_raw = x.permute(0, 1, 3, 2)       # (B, T, N, C)
+
+        x = x_4d_raw.reshape(B * T * N, C)
+        x = self.input_proj(x)                  # (B*T*N, hidden)
 
         edge_index_batch = expand_edge_index(
             self.edge_index, B * T, N, x.device
         )
 
-        delta = None  # temporal delta from GatedTSM, passed to MSE
+        # edge_attr: raw xyz 기반 동적 계산 (모든 레이어에서 공유)
+        # e_ij = (d_ij, theta_ij) -- distance + angle
+        edge_attr = compute_edge_attr(x_4d_raw, self.edge_index)  # (B*T*E_base, 2)
 
         for i, gat in enumerate(self.gat_layers):
 
-            # 1) GatedTSM: temporal shift → also produces delta for MSE
+            # 1) GatedTSM: temporal shift (before spatial GAT)
             if self.use_tsm:
                 x_4d = x.reshape(B, T, N, self.hidden_channels)
-                x_4d, delta = self.gated_tsm_layers[i](x_4d)
-                x = x_4d.reshape(B * T * N, self.hidden_channels)
+                x_4d = self.gated_tsm_layers[i](x_4d)
+                x    = x_4d.reshape(B * T * N, self.hidden_channels)
 
-            # 2) GATv2Conv: spatial message passing
-            x = gat(x, edge_index_batch)        # (B*T*N, hidden)
+            # 2) EGAT: edge-aware spatial message passing
+            x = gat(x, edge_index_batch, edge_attr=edge_attr)  # (B*T*N, hidden)
             x = F.elu(x)
 
-            # 3) MSE: motion-aware node excitation
-            if self.use_mse and delta is not None:
-                x_4d = x.reshape(B, T, N, self.hidden_channels)
-                x_4d = self.mse_layers[i](x_4d, delta)
-                x = x_4d.reshape(B * T * N, self.hidden_channels)
-
-            # 4) CausalConv1d: temporal conv (optional)
+            # 3) CausalConv1d: temporal refinement (optional)
             if self.use_causal_conv:
                 x_4d = x.reshape(B, T, N, self.hidden_channels)
                 x_4d = self.causal_conv_layers[i](x_4d)
-                x = x_4d.reshape(B * T * N, self.hidden_channels)
+                x    = x_4d.reshape(B * T * N, self.hidden_channels)
 
         # pooling & classification
         x = x.reshape(B * T, N, self.hidden_channels)
