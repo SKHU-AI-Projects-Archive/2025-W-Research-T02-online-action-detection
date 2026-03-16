@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
 
+
 KINECT_EDGES = [
     (0, 1),   # SpineBase - SpineMid
     (1, 2),   # SpineMid - SpineShoulder
@@ -40,36 +41,62 @@ def build_edge_index(edges, num_nodes, bidirectional=True):
 
 
 def compute_edge_attr(x_4d_raw, edge_index_base):
+    x_4d_raw = x_4d_raw[..., :3]
     """
-    Compute edge attributes (distance + angle) from raw xyz joint coordinates.
+    Compute temporal-adaptive edge attributes from raw xyz joint coordinates.
 
-    e_ij = (d_ij, theta_ij)
-      - d_ij     : Euclidean distance between joint i and j (3D)
-      - theta_ij : orientation angle in xy-plane (atan2(dy, dx))
+    e_ij = (d_ij, theta_ij, delta_d_ij, delta_theta_ij)
+      - d_ij          : Euclidean distance between joint i and j (3D)
+      - theta_ij      : orientation angle in xy-plane (atan2)
+      - delta_d_ij    : bone length velocity d(t) - d(t-1), causal
+      - delta_theta_ij: bone rotation speed theta(t) - theta(t-1), causal
+
+    t=0 frames use zero-padding for delta terms (causal, online-safe).
 
     Args:
         x_4d_raw       : (B, T, N, C) -- raw input xyz coordinates (before input_proj)
         edge_index_base: (2, E_base)  -- un-batched edge indices (single graph)
 
     Returns:
-        edge_attr : (B*T*E_base, 2)
+        edge_attr : (B*T*E_base, 4)
     """
     B, T, N, C = x_4d_raw.shape
+    src = edge_index_base[0]   # (E_base,)
+    dst = edge_index_base[1]   # (E_base,)
+    E = src.size(0)
+
     x_flat = x_4d_raw.reshape(B * T, N, C)
 
-    src    = edge_index_base[0]   # (E_base,)
-    dst    = edge_index_base[1]   # (E_base,)
-    E_base = src.size(0)
+    pos_i = x_flat[:, src, :]  # (B*T, E, C)
+    pos_j = x_flat[:, dst, :]  # (B*T, E, C)
+    diff  = pos_j - pos_i      # (B*T, E, C)
 
-    pos_i = x_flat[:, src, :]     # (B*T, E_base, C)
-    pos_j = x_flat[:, dst, :]     # (B*T, E_base, C)
-    diff  = pos_j - pos_i         # (B*T, E_base, C)
+    # static geometric features
+    d_ij     = diff.norm(dim=-1, keepdim=True)                        # (B*T, E, 1)
+    theta_ij = torch.atan2(diff[..., 1], diff[..., 0]).unsqueeze(-1)  # (B*T, E, 1)
 
-    d_ij     = diff.norm(dim=-1, keepdim=True)                        # (B*T, E_base, 1)
-    theta_ij = torch.atan2(diff[..., 1], diff[..., 0]).unsqueeze(-1)  # (B*T, E_base, 1)
+    # reshape to (B, T, E, 1) for temporal diff
+    d_4d     = d_ij.reshape(B, T, E, 1)
+    theta_4d = theta_ij.reshape(B, T, E, 1)
 
-    edge_attr = torch.cat([d_ij, theta_ij], dim=-1)
-    return edge_attr.reshape(B * T * E_base, 2)    # (B*T*E, 2)
+    # bone velocity: delta(t) = feat(t) - feat(t-1), t=0 -> zero pad (causal, online-safe)
+    delta_d     = torch.zeros_like(d_4d)
+    delta_theta = torch.zeros_like(theta_4d)
+    delta_d[:, 1:]     = d_4d[:, 1:] - d_4d[:, :-1]
+
+    # angle difference wrapped to [-pi, pi]
+    dtheta = theta_4d[:, 1:] - theta_4d[:, :-1]
+    dtheta = torch.atan2(torch.sin(dtheta), torch.cos(dtheta))
+    delta_theta[:, 1:] = dtheta
+
+    # flatten back to (B*T, E, 1)
+    d_ij        = d_4d.reshape(B * T, E, 1)
+    theta_ij    = theta_4d.reshape(B * T, E, 1)
+    delta_d     = delta_d.reshape(B * T, E, 1)
+    delta_theta = delta_theta.reshape(B * T, E, 1)
+
+    edge_attr = torch.cat([d_ij, theta_ij, delta_d, delta_theta], dim=-1)
+    return edge_attr.reshape(B * T * E, 4)  # (B*T*E, 4)
 
 
 def _dilated_shift(x, fold_div=8, mode='uni', dilations=(1, 2, 4, 8)):
@@ -121,7 +148,7 @@ class GatedTSM(nn.Module):
     Node-wise Gated Temporal Shift Module.
 
         gate   = sigmoid(W_g @ x + b)
-        output = x + gate (shift(x) - x)
+        output = x + gate * (shift(x) - x)
 
     bias=-2.0 -> initial gate ~0.12 -> near-identity at start
     """
@@ -166,15 +193,8 @@ class CausalConv1d(nn.Module):
     """
     Node-wise Causal Temporal Convolution (online-safe).
 
-    Applied after each GATv2Conv layer along the T dimension.
-    Each node's features are convolved independently over time
-    using left-only padding -> strictly causal, no future leakage.
-
-    Structure per layer:
-        GatedTSM -> GATv2Conv(edge_attr) -> ELU -> CausalConv1d (this module)
-
-    Uses depthwise conv (groups=channels) for efficiency.
-    Includes LayerNorm + residual connection for stability.
+    Uses left-only padding -> strictly causal, no future leakage.
+    Depthwise conv for efficiency. LayerNorm + residual for stability.
 
     Receptive field = 1 + (kernel_size - 1) * dilation frames into the past.
 
@@ -229,17 +249,22 @@ def expand_edge_index(edge_index, num_graphs, num_nodes, device):
 
 class GATv2(nn.Module):
     """
-    GATv2 with GatedTSM, EGAT (edge attributes), and optional CausalConv1d.
+    GATv2 with GatedTSM, EGAT (temporal-adaptive edge attributes),
+    CausalConv1d, and Joint-Adaptive Attention Pooling.
 
     Forward flow per layer:
         GatedTSM -> GATv2Conv(edge_attr) -> ELU -> (CausalConv1d)
 
-    Edge attributes e_ij = (d_ij, theta_ij) computed from raw xyz:
-      - d_ij     : 3D Euclidean distance between joints i and j
-      - theta_ij : orientation angle in xy-plane (atan2)
+    Edge attributes e_ij = (d_ij, theta_ij, delta_d_ij, delta_theta_ij):
+      - d_ij          : 3D Euclidean distance between joints i and j
+      - theta_ij      : orientation angle in xy-plane
+      - delta_d_ij    : bone length velocity (causal)
+      - delta_theta_ij: bone rotation speed (causal)
 
-    This follows the EGAT formulation (StoneGAT, IJCAS 2025),
-    adapted for 3D Kinect skeleton without confidence scores.
+    Pooling: Joint-Adaptive Attention Pooling (replaces mean pooling)
+      - Learns which joints are action-critical per frame
+      - att = softmax(W_att @ h_node, dim=joint)
+      - output = sum(att * h_node, dim=joint)
 
     Config keys
     -----------
@@ -250,11 +275,11 @@ class GATv2(nn.Module):
     dropout          : float
     num_nodes        : int   -- skeleton joints (25 for Kinect)
     num_gat_layers   : int   -- number of stacked GATv2Conv layers (default 2)
-    use_tsm          : bool  -- whether to apply GatedTSM before each GAT layer (default True)
+    use_tsm          : bool  -- whether to apply GatedTSM (default True)
     tsm_mode         : str   -- 'uni' (online-safe) or 'bi' (offline) (default 'uni')
     tsm_fold_div     : int   -- fold = hidden // tsm_fold_div (default 8)
-    tsm_dilations    : tuple -- dilation list e.g. (1,2,4,8)
-    use_causal_conv  : bool  -- whether to apply CausalConv1d after each GAT layer (default False)
+    tsm_dilations    : tuple -- dilation list e.g. (1,2,4,16)
+    use_causal_conv  : bool  -- whether to apply CausalConv1d (default False)
     causal_kernel    : int   -- kernel size for CausalConv1d (default 3)
     causal_dilation  : int   -- dilation for CausalConv1d (default 1)
     """
@@ -292,14 +317,14 @@ class GATv2(nn.Module):
         self.causal_kernel   = int(getattr(config, 'causal_kernel', 3))
         self.causal_dilation = int(getattr(config, 'causal_dilation', 1))
 
-        # -- edge attr dim: distance + angle = 2 --
-        self.edge_attr_dim = 2
+        # -- edge attr dim: distance + angle + bone velocity = 4 --
+        self.edge_attr_dim = 4
 
         # -- layers --
         self.input_proj = nn.Linear(self.in_channels, self.hidden_channels)
 
-        # EGAT: GATv2Conv with edge_dim=2
-        # add_self_loops=False: self-loop에는 edge_attr이 없으므로 비활성화
+        # EGAT: GATv2Conv with temporal-adaptive edge attributes
+        # add_self_loops=False: self-loop has no edge_attr
         self.gat_layers = nn.ModuleList([
             GATv2Conv(
                 in_channels=self.hidden_channels,
@@ -313,7 +338,7 @@ class GATv2(nn.Module):
             for _ in range(self.num_gat_layers)
         ])
 
-        # GatedTSM: one per GAT layer
+        # GatedTSM: one per GAT layer (config에서 tsm_mode, tsm_fold_div, tsm_dilations 반영)
         if self.use_tsm:
             self.gated_tsm_layers = nn.ModuleList([
                 GatedTSM(
@@ -340,6 +365,10 @@ class GATv2(nn.Module):
         edge_index = build_edge_index(KINECT_EDGES, self.num_nodes, bidirectional=True)
         self.register_buffer('edge_index', edge_index)
 
+        # Joint-Adaptive Attention Pooling
+        # Learns which joints are action-critical per frame, replacing mean pooling
+        self.joint_att = nn.Linear(self.hidden_channels, 1)
+
         self.classifier = nn.Linear(self.hidden_channels, self.out_channels)
 
     def forward(self, x):
@@ -361,9 +390,8 @@ class GATv2(nn.Module):
             self.edge_index, B * T, N, x.device
         )
 
-        # edge_attr: raw xyz 기반 동적 계산 (모든 레이어에서 공유)
-        # e_ij = (d_ij, theta_ij) -- distance + angle
-        edge_attr = compute_edge_attr(x_4d_raw, self.edge_index)  # (B*T*E_base, 2)
+        # edge_attr: temporal-adaptive (static geometry + bone velocity)
+        edge_attr = compute_edge_attr(x_4d_raw, self.edge_index)  # (B*T*E, 4)
 
         for i, gat in enumerate(self.gat_layers):
 
@@ -383,9 +411,12 @@ class GATv2(nn.Module):
                 x_4d = self.causal_conv_layers[i](x_4d)
                 x    = x_4d.reshape(B * T * N, self.hidden_channels)
 
-        # pooling & classification
-        x = x.reshape(B * T, N, self.hidden_channels)
-        x = x.mean(dim=1)
+        # Joint-Adaptive Attention Pooling (replaces mean pooling)
+        # Learns which joints are action-critical per frame
+        x   = x.reshape(B * T, N, self.hidden_channels)     # (B*T, N, hidden)
+        att = torch.softmax(self.joint_att(x), dim=1)        # (B*T, N, 1)
+        x   = (x * att).sum(dim=1)                          # (B*T, hidden)
+
         x = self.classifier(x)
 
         return x.reshape(B, T, self.out_channels)
