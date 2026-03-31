@@ -1,53 +1,62 @@
 import torch
+import numpy as np
+from sklearn.metrics import average_precision_score
 from tqdm import tqdm
 
 
 class Evaluator:
-    def __init__(self, model, test_loader, criterion, metrics, device, config, logger):
+    def __init__(self, model, test_loader, criterion, device, config, logger, background_class_idx=0):
         self.model = model
         self.test_loader = test_loader
         self.criterion = criterion
-        self.metrics = metrics
         self.device = device
         self.config = config
         self.logger = logger
+        self.background_class_idx = background_class_idx
 
     def evaluate(self):
         self.model.eval()
         test_loss = 0.0
-        metric_results = {name: 0.0 for name in self.metrics.keys()}
-        total_samples = 0
+        all_scores = []
+        all_labels = []
 
         with torch.no_grad():
             pbar = tqdm(self.test_loader, desc="[Evaluate]")
             for inputs, targets in pbar:
-                inputs = inputs.to(self.device)
+                inputs  = inputs.to(self.device)
                 targets = targets.to(self.device)
 
                 outputs = self.model(inputs)
-
-                # 🔥 frame-wise flatten (중요)
-                outputs = outputs.reshape(-1, outputs.shape[-1])  # (B*T, C)
-                targets = targets.reshape(-1)                     # (B*T)
+                if outputs.dim() == 3:
+                    outputs = outputs[:, -1, :]  # (B, C)
 
                 loss = self.criterion(outputs, targets)
                 test_loss += loss.item()
 
-                batch_size = targets.size(0)
-                total_samples += batch_size
-
-                for name, metric_fn in self.metrics.items():
-                    metric_results[name] += metric_fn(outputs, targets) * batch_size
-
+                scores = torch.softmax(outputs, dim=-1)
+                all_scores.append(scores.cpu().numpy())
+                all_labels.append(targets.cpu().numpy())
                 pbar.set_postfix({'loss': test_loss / (pbar.n + 1)})
 
+        all_scores = np.concatenate(all_scores, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
+
+        num_classes = all_scores.shape[1]
+        ap_per_class = []
+        for c in range(num_classes):
+            if c == self.background_class_idx:
+                continue
+            binary_labels = (all_labels == c).astype(int)
+            if binary_labels.sum() == 0:
+                continue
+            ap = average_precision_score(binary_labels, all_scores[:, c])
+            ap_per_class.append(ap)
+
+        mAP = float(np.mean(ap_per_class)) if ap_per_class else 0.0
         avg_loss = test_loss / len(self.test_loader)
-        final_metrics = {name: val / total_samples for name, val in metric_results.items()}
 
-        log_str = f"Evaluation Completed. Test Loss: {avg_loss:.4f}"
-        for name, val in final_metrics.items():
-            log_str += f" | {name.capitalize()}: {val:.4f}"
-
-        self.logger.info(log_str)
-
-        return avg_loss, final_metrics
+        self.logger.info(
+            f"Evaluation Completed. Test Loss: {avg_loss:.4f} | mAP: {mAP:.4f} "
+            f"(Evaluated: {len(ap_per_class)}/{num_classes - 1} classes)"
+        )
+        return avg_loss, {"mAP": mAP, "ap_per_class": ap_per_class}
