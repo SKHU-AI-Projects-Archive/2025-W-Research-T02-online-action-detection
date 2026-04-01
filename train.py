@@ -38,10 +38,9 @@ def main():
     train_loader = build_dataloader(config, split='train')
     val_loader   = build_dataloader(config, split='val')
     
-    logger.info("Building Model, Loss, Metrics, Optimizer, and Scheduler...")
+    logger.info("Building Model, Loss, Optimizer, and Scheduler...")
     model     = build_model(config).to(device)
     criterion = build_criterion(config)
-    metrics   = build_metrics(config)
     optimizer = build_optimizer(model, config)
     scheduler = build_scheduler(optimizer, config)
 
@@ -51,7 +50,6 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         criterion=criterion,
-        metrics=metrics,
         optimizer=optimizer,
         scheduler=scheduler,
         device=device,

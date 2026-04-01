@@ -1,15 +1,17 @@
 import os
 import copy
+import numpy as np
 import torch
+from sklearn.metrics import average_precision_score
 from tqdm import tqdm
 
+
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, criterion, metrics, optimizer, scheduler, device, config, logger):
+    def __init__(self, model, train_loader, val_loader, criterion, optimizer, scheduler, device, config, logger):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.criterion = criterion
-        self.metrics = metrics
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
@@ -23,63 +25,86 @@ class Trainer:
     def _train_epoch(self, epoch):
         self.model.train()
         train_loss = 0.0
-        
+
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config.total_epoch} [Train]")
         for inputs, targets in pbar:
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            inputs  = inputs.to(self.device)   # (B, T, C, N)
+            targets = targets.to(self.device)  # (B, T)
 
             self.optimizer.zero_grad()
-            outputs = self.model(inputs)
-            outputs = outputs.view(-1, self.config.num_classes)
-            targets = targets.view(-1)
-            loss = self.criterion(outputs, targets)
+            outputs = self.model(inputs)       # (B, T, num_classes)
+
+            loss = self.criterion(
+                outputs.reshape(-1, outputs.shape[-1]),  # (B*T, C)
+                targets.reshape(-1)                      # (B*T,)
+            )
             loss.backward()
             self.optimizer.step()
 
             train_loss += loss.item()
             pbar.set_postfix({'loss': train_loss / (pbar.n + 1)})
-            
+
         return train_loss / len(self.train_loader)
 
     def _validate_epoch(self, epoch):
         self.model.eval()
         val_loss = 0.0
+        all_scores = []
+        all_labels = []
 
-        metric_results = {name: 0.0 for name in self.metrics.keys()}
-        total_samples = 0
-        
         with torch.no_grad():
             pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.config.total_epoch} [Valid]")
             for inputs, targets in pbar:
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                inputs  = inputs.to(self.device)   # (B, T, C, N)
+                targets = targets.to(self.device)  # (B, T)
 
-                outputs = self.model(inputs)
-                outputs = outputs.view(-1, self.config.num_classes)
-                targets = targets.view(-1)
-                loss = self.criterion(outputs, targets)
+                outputs = self.model(inputs)       # (B, T, num_classes)
+
+                loss = self.criterion(
+                    outputs.reshape(-1, outputs.shape[-1]),  # (B*T, C)
+                    targets.reshape(-1)                      # (B*T,)
+                )
                 val_loss += loss.item()
 
-                batch_size = targets.size(0)
-                total_samples += batch_size
-                for name, metric_fn in self.metrics.items():
-                    metric_results[name] += metric_fn(outputs, targets) * batch_size
+                # Use last frame only for mAP (SSNet protocol)
+                last_scores  = torch.softmax(outputs[:, -1, :], dim=-1)  # (B, C)
+                last_targets = targets[:, -1]                             # (B,)
 
+                all_scores.append(last_scores.cpu().numpy())
+                all_labels.append(last_targets.cpu().numpy())
                 pbar.set_postfix({'val_loss': val_loss / (pbar.n + 1)})
-                
+
+        all_scores = np.concatenate(all_scores, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
+
+        num_classes = all_scores.shape[1]
+        ap_per_class = []
+        for c in range(num_classes):
+            if c == 0:
+                continue
+            binary_labels = (all_labels == c).astype(int)
+            if binary_labels.sum() == 0:
+                continue
+            ap = average_precision_score(binary_labels, all_scores[:, c])
+            ap_per_class.append(ap)
+
+        mAP = float(np.mean(ap_per_class)) if ap_per_class else 0.0
+
+        # Frame-level accuracy (SSNet protocol, background included)
+        all_preds  = np.argmax(all_scores, axis=1)
+        accuracy   = float((all_preds == all_labels).mean())
+
         avg_loss = val_loss / len(self.val_loader)
-        final_metrics = {name: val / total_samples for name, val in metric_results.items()}
-        
-        return avg_loss, final_metrics
+        return avg_loss, {"mAP": mAP, "accuracy": accuracy}
 
     def fit(self):
         for epoch in range(1, self.config.total_epoch + 1):
             train_loss = self._train_epoch(epoch)
             val_loss, val_metrics = self._validate_epoch(epoch)
-            
+
             log_str = f"Epoch {epoch} -> Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}"
             for name, val in val_metrics.items():
                 log_str += f" | Val {name.capitalize()}: {val:.4f}"
-            
             self.logger.info(log_str)
 
             if self.scheduler:
@@ -92,7 +117,6 @@ class Trainer:
                 self.best_val_loss = val_loss
                 self.early_stop_counter = 0
                 self.best_weights = copy.deepcopy(self.model.state_dict())
-                
                 torch.save(self.best_weights, os.path.join(self.config.log_dir, 'best_model.pth'))
                 self.logger.info("  [*] Best model saved.")
             else:
