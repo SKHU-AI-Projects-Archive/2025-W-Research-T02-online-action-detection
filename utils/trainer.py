@@ -28,14 +28,16 @@ class Trainer:
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config.total_epoch} [Train]")
         for inputs, targets in pbar:
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            inputs  = inputs.to(self.device)   # (B, T, C, N)
+            targets = targets.to(self.device)  # (B, T)
 
             self.optimizer.zero_grad()
-            outputs = self.model(inputs)
-            if outputs.dim() == 3:
-                outputs = outputs[:, -1, :]  # (B, C)
+            outputs = self.model(inputs)       # (B, T, num_classes)
 
-            loss = self.criterion(outputs, targets)
+            loss = self.criterion(
+                outputs.reshape(-1, outputs.shape[-1]),  # (B*T, C)
+                targets.reshape(-1)                      # (B*T,)
+            )
             loss.backward()
             self.optimizer.step()
 
@@ -53,18 +55,23 @@ class Trainer:
         with torch.no_grad():
             pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.config.total_epoch} [Valid]")
             for inputs, targets in pbar:
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                inputs  = inputs.to(self.device)   # (B, T, C, N)
+                targets = targets.to(self.device)  # (B, T)
 
-                outputs = self.model(inputs)
-                if outputs.dim() == 3:
-                    outputs = outputs[:, -1, :]  # (B, C)
+                outputs = self.model(inputs)       # (B, T, num_classes)
 
-                loss = self.criterion(outputs, targets)
+                loss = self.criterion(
+                    outputs.reshape(-1, outputs.shape[-1]),  # (B*T, C)
+                    targets.reshape(-1)                      # (B*T,)
+                )
                 val_loss += loss.item()
 
-                scores = torch.softmax(outputs, dim=-1)
-                all_scores.append(scores.cpu().numpy())
-                all_labels.append(targets.cpu().numpy())
+                # Use last frame only for mAP (SSNet protocol)
+                last_scores  = torch.softmax(outputs[:, -1, :], dim=-1)  # (B, C)
+                last_targets = targets[:, -1]                             # (B,)
+
+                all_scores.append(last_scores.cpu().numpy())
+                all_labels.append(last_targets.cpu().numpy())
                 pbar.set_postfix({'val_loss': val_loss / (pbar.n + 1)})
 
         all_scores = np.concatenate(all_scores, axis=0)
@@ -82,9 +89,13 @@ class Trainer:
             ap_per_class.append(ap)
 
         mAP = float(np.mean(ap_per_class)) if ap_per_class else 0.0
-        avg_loss = val_loss / len(self.val_loader)
 
-        return avg_loss, {"mAP": mAP}
+        # Frame-level accuracy (SSNet protocol, background included)
+        all_preds  = np.argmax(all_scores, axis=1)
+        accuracy   = float((all_preds == all_labels).mean())
+
+        avg_loss = val_loss / len(self.val_loader)
+        return avg_loss, {"mAP": mAP, "accuracy": accuracy}
 
     def fit(self):
         for epoch in range(1, self.config.total_epoch + 1):

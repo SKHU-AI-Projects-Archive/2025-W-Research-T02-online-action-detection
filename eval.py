@@ -130,35 +130,41 @@ def visualize_predictions(model, test_loader, device, config, save_dir, num_samp
 
     with torch.no_grad():
         for inputs, targets in test_loader:
-            inputs = inputs.to(device)
-            outputs = model(inputs)
+            inputs  = inputs.to(device)            # (B, T, C, N)
+            targets = targets.cpu().numpy()        # (B, T)
 
-            if outputs.dim() == 3:
-                last_outputs = outputs[:, -1, :]  # (B, C)
-            else:
-                last_outputs = outputs
-
-            preds   = torch.argmax(last_outputs, dim=-1).cpu().numpy()  # (B,)
-            targets = targets.cpu().numpy()                              # (B,)
+            outputs = model(inputs)                # (B, T, num_classes)
+            preds   = torch.argmax(outputs, dim=-1).cpu().numpy()  # (B, T)
 
             # (B, T, C, N) -> (B, T, N, C)
             skeleton = inputs.cpu().numpy().transpose(0, 1, 3, 2)
 
             for i in range(len(targets)):
-                gt_label   = int(targets[i])
-                pred_label = int(preds[i])
+                gt_labels   = targets[i]           # (T,)
+                pred_labels = preds[i]             # (T,)
+                gt_last     = int(gt_labels[-1])
+                pred_last   = int(pred_labels[-1])
 
-                if gt_label == 0:
+                # Skip background-only windows
+                if (gt_labels > 0).sum() == 0:
                     continue
 
-                # ── 1. Prediction bar ──
-                fig1, ax = plt.subplots(figsize=(6, 2))
-                ax.barh(0, 1, color=colors[gt_label],   label=f'GT: {gt_label}')
-                ax.barh(1, 1, color=colors[pred_label], label=f'Pred: {pred_label}')
-                ax.set_yticks([0, 1])
-                ax.set_yticklabels(['GT', 'Pred'])
-                ax.set_title(f'Sample {samples_saved + 1} | GT={gt_label} Pred={pred_label}')
-                ax.legend(loc='right')
+                T = len(gt_labels)
+
+                # ── 1. Prediction bar (GT vs Pred per frame) ──
+                fig1, axes = plt.subplots(2, 1, figsize=(14, 3))
+                for t in range(T):
+                    axes[0].barh(0, 1, left=t, color=colors[gt_labels[t]],   edgecolor='none')
+                    axes[1].barh(0, 1, left=t, color=colors[pred_labels[t]], edgecolor='none')
+                axes[0].set_xlim(0, T)
+                axes[1].set_xlim(0, T)
+                axes[0].set_yticks([0]); axes[0].set_yticklabels(['GT'])
+                axes[1].set_yticks([0]); axes[1].set_yticklabels(['Pred'])
+                axes[0].set_title(f'Sample {samples_saved + 1} | Last frame GT={gt_last} Pred={pred_last}')
+                axes[1].set_xlabel('Frame')
+                unique_classes = np.unique(np.concatenate([gt_labels, pred_labels]))
+                patches = [mpatches.Patch(color=colors[c], label=f'Class {c}') for c in unique_classes]
+                fig1.legend(handles=patches, loc='right', bbox_to_anchor=(1.12, 0.5))
                 plt.tight_layout()
                 pred_path = os.path.join(save_dir, f'sample_{samples_saved + 1}_prediction.png')
                 plt.savefig(pred_path, bbox_inches='tight', dpi=150)
@@ -166,11 +172,11 @@ def visualize_predictions(model, test_loader, device, config, save_dir, num_samp
 
                 # ── 2. Skeleton PNG ──
                 png_path = os.path.join(save_dir, f'sample_{samples_saved + 1}_skeleton.png')
-                save_skeleton_png(skeleton[i], [gt_label] * skeleton[i].shape[0], png_path)
+                save_skeleton_png(skeleton[i], gt_labels, png_path)
 
                 # ── 3. Skeleton GIF ──
                 gif_path = os.path.join(save_dir, f'sample_{samples_saved + 1}_skeleton.gif')
-                save_skeleton_gif(skeleton[i], [gt_label] * skeleton[i].shape[0], gif_path)
+                save_skeleton_gif(skeleton[i], gt_labels, gif_path)
 
                 samples_saved += 1
                 if samples_saved >= num_samples:

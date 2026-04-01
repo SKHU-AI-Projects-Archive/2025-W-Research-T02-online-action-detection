@@ -15,7 +15,6 @@ class OAD(Dataset):
         self.data_path = os.path.join(self.data_dir, "Data")
         self.label_path = os.path.join(self.data_dir, "Label")
 
-        # Load split info
         split_file = os.path.join(self.data_dir, "Split", "Split.txt")
         target = "training" if split == "train" else "testing"
 
@@ -28,8 +27,12 @@ class OAD(Dataset):
                 file_list = [f"{idx}.txt" for idx in indices]
                 break
 
-        # ✅ Set stride: 1 for testing (predict every frame), larger for training efficiency
-        self.stride = 1 if self.split != "train" else max(1, self.num_frames // 8)
+        if self.split == "train":
+            self.stride = max(1, self.num_frames // 8)
+        elif self.split == "val":
+            self.stride = 8
+        else:  # test
+            self.stride = 1
 
         self._data = []
         self._labels = []
@@ -48,10 +51,11 @@ class OAD(Dataset):
                 with open(label_file, "r") as f:
                     for ln in f:
                         ln = ln.strip()
-                        if not ln: continue
+                        if not ln:
+                            continue
                         cls, start, end = map(int, ln.split(","))
                         start = max(0, min(start, T - 1))
-                        end = max(0, min(end, T - 1))
+                        end   = max(0, min(end, T - 1))
                         if end >= start:
                             labels[start:end + 1] = cls
 
@@ -60,7 +64,6 @@ class OAD(Dataset):
             self._lengths.append(T)
             self._files.append(file_name)
 
-        # Build windows based on last-frame labeling
         self.windows = []
         for file_id, T in enumerate(self._lengths):
             if T >= self.num_frames:
@@ -72,50 +75,43 @@ class OAD(Dataset):
         if self.split == "train":
             random.shuffle(self.windows)
 
+        print(f"[DEBUG] OAD split={split} | Windows: {len(self.windows)} | Stride: {self.stride}")
+
     def __len__(self):
         return len(self.windows)
 
     @staticmethod
     def _normalize_skeleton(clip):
-        # 1) Center at SpineBase (joint 0)
         clip = clip - clip[:, 0:1, :]
-        # 2) Scale by shoulder distance
         shoulder_dist = np.linalg.norm(clip[:, 5, :] - clip[:, 9, :], axis=1).mean() + 1e-6
         return clip / shoulder_dist
 
     @staticmethod
     def _compute_velocity(clip):
-        # Causal backward velocity: v_t = x_t - x_{t-1}
         vel = np.zeros_like(clip)
         vel[1:] = clip[1:] - clip[:-1]
         return vel
 
     def __getitem__(self, idx):
         file_id, start_idx = self.windows[idx]
-        data = self._data[file_id]
+        data   = self._data[file_id]
         labels = self._labels[file_id]
-        T = self._lengths[file_id]
+        T      = self._lengths[file_id]
 
-        # Slicing and Padding
         if T >= self.num_frames:
-            clip = data[start_idx:start_idx + self.num_frames]
+            clip        = data[start_idx:start_idx + self.num_frames]
             clip_labels = labels[start_idx:start_idx + self.num_frames]
         else:
             pad_len = self.num_frames - T
-            clip = np.pad(data, ((0, pad_len), (0, 0), (0, 0)), mode='constant')
-            clip_labels = np.pad(labels, (0, pad_len), mode='constant')
+            clip        = np.pad(data,   ((0, pad_len), (0, 0), (0, 0)), mode='constant')
+            clip_labels = np.pad(labels, (0, pad_len),                   mode='constant')
 
-        # Preprocessing
         clip = self._normalize_skeleton(clip)
-        vel = self._compute_velocity(clip)
-        
-        # Concat xyz and velocity: (T, N, 6)
-        clip = np.concatenate([clip, vel], axis=-1)
-        
-        # Format: (T, 6, N)
-        clip = torch.from_numpy(clip).permute(0, 2, 1).contiguous()
-        
-        # ✅ Return only the last frame's label for OAD protocol
-        target_label = torch.tensor(int(clip_labels[-1]), dtype=torch.long)
+        vel  = self._compute_velocity(clip)
+        clip = np.concatenate([clip, vel], axis=-1)           # (T, N, 6)
+        clip = torch.from_numpy(clip).permute(0, 2, 1).contiguous()  # (T, 6, N)
 
-        return clip, target_label
+        # Return full frame labels (T,)
+        clip_labels = torch.from_numpy(clip_labels).long()
+
+        return clip, clip_labels

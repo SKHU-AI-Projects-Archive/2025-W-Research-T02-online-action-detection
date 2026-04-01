@@ -48,9 +48,9 @@ def compute_edge_attr(x_4d_raw, edge_index_base):
     E = src.size(0)
 
     x_flat = x_4d_raw.reshape(B * T, N, C)
-    pos_i = x_flat[:, src, :]
-    pos_j = x_flat[:, dst, :]
-    diff  = pos_j - pos_i
+    pos_i  = x_flat[:, src, :]
+    pos_j  = x_flat[:, dst, :]
+    diff   = pos_j - pos_i
 
     d_ij     = diff.norm(dim=-1, keepdim=True)
     theta_ij = torch.atan2(diff[..., 1], diff[..., 0]).unsqueeze(-1)
@@ -76,6 +76,7 @@ def compute_edge_attr(x_4d_raw, edge_index_base):
 
 
 def _dilated_shift(x, fold_div=8, mode='uni', dilations=(1, 2, 4, 8)):
+    """Dilated Temporal Shift (parameter-free)."""
     B, T, N, C = x.shape
     fold_total = C // fold_div
     num_groups = len(dilations)
@@ -107,6 +108,12 @@ def _dilated_shift(x, fold_div=8, mode='uni', dilations=(1, 2, 4, 8)):
 
 
 class GatedTSM(nn.Module):
+    """
+    Node-wise Gated Temporal Shift Module.
+    gate = sigmoid(W_g @ x + b)
+    output = x + gate * (shift(x) - x)
+    bias=-2.0 -> initial gate ~0.12 -> near-identity at init
+    """
     def __init__(self, channels, num_nodes, fold_div=8, mode='uni', dilations=(1, 2, 4, 8)):
         super().__init__()
         self.channels  = channels
@@ -115,22 +122,18 @@ class GatedTSM(nn.Module):
         self.mode      = mode
         self.dilations = dilations
 
-        assert channels // fold_div > 0, \
-            f"fold_total = channels({channels}) // fold_div({fold_div}) must be > 0"
-
+        assert channels // fold_div > 0
         self.gate_proj = nn.Linear(channels, channels, bias=True)
         nn.init.xavier_uniform_(self.gate_proj.weight, gain=0.1)
         nn.init.constant_(self.gate_proj.bias, -2.0)
 
     def forward(self, x_4d):
         B, T, N, C = x_4d.shape
-        assert N == self.num_nodes, \
-            f"GatedTSM expected num_nodes={self.num_nodes}, got {N}"
+        assert N == self.num_nodes
 
         x_flat  = x_4d.reshape(B * T * N, C)
         gate    = torch.sigmoid(self.gate_proj(x_flat))
         gate_4d = gate.reshape(B, T, N, C)
-
         shifted = _dilated_shift(x_4d, self.fold_div, self.mode, self.dilations)
         delta   = shifted - x_4d
 
@@ -138,6 +141,11 @@ class GatedTSM(nn.Module):
 
 
 class CausalConv1d(nn.Module):
+    """
+    Node-wise Causal Temporal Convolution.
+    Left-only padding ensures no future leakage (online-safe).
+    Receptive field = 1 + (kernel_size - 1) * dilation frames into the past.
+    """
     def __init__(self, channels, kernel_size=3, dilation=1):
         super().__init__()
         self.pad = (kernel_size - 1) * dilation
@@ -173,6 +181,31 @@ def expand_edge_index(edge_index, num_graphs, num_nodes, device):
 
 
 class GATv2(nn.Module):
+    """
+    GATv2 with residual connections, GatedTSM, EGAT, CausalConv1d,
+    and Joint-Adaptive Attention Pooling.
+
+    Forward flow per layer:
+        GatedTSM -> GATv2Conv(edge_attr) -> ELU -> residual add -> (CausalConv1d)
+
+    Config keys
+    -----------
+    in_channels      : input joint feature dim (6 = xyz + velocity)
+    hidden_channels  : internal feature dim (must be divisible by num_heads)
+    out_channels     : number of action classes
+    num_heads        : GAT attention heads
+    dropout          : float
+    num_nodes        : 25 (Kinect joints)
+    num_gat_layers   : number of stacked GATv2Conv layers (default 4)
+    use_tsm          : whether to apply GatedTSM (default True)
+    tsm_mode         : 'uni' (online-safe) or 'bi' (offline)
+    tsm_fold_div     : fold = hidden // tsm_fold_div (default 8)
+    tsm_dilations    : dilation list e.g. (1,2,4,8)
+    use_causal_conv  : whether to apply CausalConv1d (default False)
+    causal_kernel    : kernel size for CausalConv1d (default 3)
+    causal_dilation  : dilation for CausalConv1d (default 1)
+    """
+
     def __init__(self, config):
         super(GATv2, self).__init__()
 
@@ -181,30 +214,24 @@ class GATv2(nn.Module):
         self.out_channels    = int(config.out_channels)
         self.num_heads       = int(config.num_heads)
         self.dropout         = float(config.dropout)
-        self.num_nodes       = int(config.num_nodes)
+        self.num_nodes       = int(config.num_nodes)  # 25
 
-        assert self.hidden_channels % self.num_heads == 0, \
-            "hidden_channels must be divisible by num_heads"
+        assert self.hidden_channels % self.num_heads == 0
         self.head_dim = self.hidden_channels // self.num_heads
 
-        self.num_gat_layers = int(getattr(config, 'num_gat_layers', 4))  # 4-hop coverage
-        self.use_tsm        = bool(getattr(config, 'use_tsm', True))
-        self.tsm_mode       = str(getattr(config, 'tsm_mode', 'uni'))
-        self.tsm_fold_div   = int(getattr(config, 'tsm_fold_div', 8))
-        self.tsm_dilations  = tuple(getattr(config, 'tsm_dilations', (1, 2, 4, 8)))
-
-        fold_total = self.hidden_channels // self.tsm_fold_div
-        assert fold_total % len(self.tsm_dilations) == 0, (
-            f"fold_total ({fold_total}) must be divisible by "
-            f"len(tsm_dilations) ({len(self.tsm_dilations)})"
-        )
-
+        self.num_gat_layers  = int(getattr(config, 'num_gat_layers', 4))
+        self.use_tsm         = bool(getattr(config, 'use_tsm', True))
+        self.tsm_mode        = str(getattr(config, 'tsm_mode', 'uni'))
+        self.tsm_fold_div    = int(getattr(config, 'tsm_fold_div', 8))
+        self.tsm_dilations   = tuple(getattr(config, 'tsm_dilations', (1, 2, 4, 8)))
         self.use_causal_conv = bool(getattr(config, 'use_causal_conv', False))
         self.causal_kernel   = int(getattr(config, 'causal_kernel', 3))
         self.causal_dilation = int(getattr(config, 'causal_dilation', 1))
 
-        self.edge_attr_dim = 4
+        fold_total = self.hidden_channels // self.tsm_fold_div
+        assert fold_total % len(self.tsm_dilations) == 0
 
+        self.edge_attr_dim = 4
         self.input_proj = nn.Linear(self.in_channels, self.hidden_channels)
 
         self.gat_layers = nn.ModuleList([
@@ -245,7 +272,7 @@ class GATv2(nn.Module):
         edge_index = build_edge_index(KINECT_EDGES, self.num_nodes, bidirectional=True)
         self.register_buffer('edge_index', edge_index)
 
-        self.joint_att = nn.Linear(self.hidden_channels, 1)
+        self.joint_att  = nn.Linear(self.hidden_channels, 1)
         self.classifier = nn.Linear(self.hidden_channels, self.out_channels)
 
     def forward(self, x):
@@ -257,17 +284,17 @@ class GATv2(nn.Module):
         """
         B, T, C, N = x.shape
 
-        x_4d_raw = x.permute(0, 1, 3, 2)           # (B, T, N, C)
+        x_4d_raw = x.permute(0, 1, 3, 2)          # (B, T, N, C)
         x = x_4d_raw.reshape(B * T * N, C)
-        x = self.input_proj(x)                      # (B*T*N, hidden)
+        x = self.input_proj(x)                     # (B*T*N, hidden)
 
         edge_index_batch = expand_edge_index(
             self.edge_index, B * T, N, x.device
         )
-        edge_attr = compute_edge_attr(x_4d_raw, self.edge_index)  # (B*T*E, 4)
+        edge_attr = compute_edge_attr(x_4d_raw, self.edge_index)
 
         for i, gat in enumerate(self.gat_layers):
-            x_res = x                               # ✅ residual
+            x_res = x  # residual
 
             if self.use_tsm:
                 x_4d = x.reshape(B, T, N, self.hidden_channels)
@@ -276,7 +303,7 @@ class GATv2(nn.Module):
 
             x = gat(x, edge_index_batch, edge_attr=edge_attr)
             x = F.elu(x)
-            x = x + x_res                           # ✅ residual add
+            x = x + x_res  # residual add
 
             if self.use_causal_conv:
                 x_4d = x.reshape(B, T, N, self.hidden_channels)
@@ -286,8 +313,7 @@ class GATv2(nn.Module):
         # Joint-Adaptive Attention Pooling
         x   = x.reshape(B * T, N, self.hidden_channels)
         att = torch.softmax(self.joint_att(x), dim=1)
-        x   = (x * att).sum(dim=1)                 # (B*T, hidden)
+        x   = (x * att).sum(dim=1)                # (B*T, hidden)
 
         x = self.classifier(x)
-
         return x.reshape(B, T, self.out_channels)
